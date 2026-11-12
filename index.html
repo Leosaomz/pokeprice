@@ -220,7 +220,10 @@ async function readCard(img) {
     const worker = await workerP;
     // try upright, then upside-down (card held the other way)
     let r = await ocrPass(worker, img);
-    if (!r.num && !r.name) r = await ocrPass(worker, rotate180(img));
+    if (!r.num) {
+      const flipped = await ocrPass(worker, rotate180(img));
+      if (flipped.num || !r.name) r = flipped;
+    }
     const { name, num, top, bottom } = r;
     const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
     $('q').value = q;
