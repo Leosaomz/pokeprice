@@ -92,7 +92,7 @@ async function openScanner() {
   $('scanTip').textContent = 'Abrindo câmera…';
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+      video: { facingMode: 'environment', width: { ideal: 3840 }, height: { ideal: 2160 } }, audio: false });
   } catch (err) {
     $('scanTip').textContent = 'Sem acesso à câmera: ' + err.message;
     return;
@@ -190,18 +190,19 @@ async function capture(manual) {
     const s = v.videoWidth / 480;
     let q = lastQuad.map(p => ({ x: p.x * s, y: p.y * s }));
     if (dist(q[0], q[1]) > dist(q[0], q[3])) q = [q[3], q[0], q[1], q[2]];  // landscape → rotate to portrait
-    out = warp(full, q);
+    const h = Math.max(H, dist(q[0], q[3]), dist(q[1], q[2]));              // keep native resolution
+    out = warp(full, q, Math.round(h * W / H), Math.round(h));
   } else if (!manual) { busy = false; return; }
   closeScanner();
   readCard(out);
 }
 
-function warp(canvas, q) {
+function warp(canvas, q, w = W, h = H) {
   const src = cv.imread(canvas), dst = new cv.Mat();
   const from = cv.matFromArray(4, 1, cv.CV_32FC2, q.flatMap(p => [p.x, p.y]));
-  const to = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H]);
+  const to = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, w, 0, w, h, 0, h]);
   const M = cv.getPerspectiveTransform(from, to);
-  cv.warpPerspective(src, dst, M, new cv.Size(W, H));
+  cv.warpPerspective(src, dst, M, new cv.Size(w, h), cv.INTER_CUBIC);
   const out = document.createElement('canvas');
   cv.imshow(out, dst);
   [src, dst, from, to, M].forEach(m => m.delete());
@@ -217,16 +218,36 @@ async function readCard(img) {
   try {
     workerP ??= Tesseract.createWorker('eng');
     const worker = await workerP;
-    const top = (await worker.recognize(band(img, 0.02, 0.12))).data.text;
-    const bottom = (await worker.recognize(band(img, 0.86, 1))).data.text;
-    const num = bottom.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
-    const skip = /^(basic|stage|basico|básico|estágio|estagio|evolves|evolui|trainer|item|pokémon|pokemon)$/i;
-    const name = (top.match(/[A-ZÀ-Ú][A-Za-zÀ-ú'.-]{2,}/g) || []).find(w => !skip.test(w)) || '';
+    // try upright, then upside-down (card held the other way)
+    let r = await ocrPass(worker, img);
+    if (!r.num && !r.name) r = await ocrPass(worker, rotate180(img));
+    const { name, num, top, bottom } = r;
     const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
     $('q').value = q;
-    $('debug').textContent = `Topo: ${top.trim() || '—'}\nRodapé: ${bottom.trim() || '—'}`;
+    $('debug').textContent = `Imagem: ${img.width}×${img.height}\nTopo: ${top.trim() || '—'}\nRodapé: ${bottom.trim() || '—'}`;
     q ? search(q) : status('Não consegui ler. Digite o nome/número.');
   } catch (err) { status('Erro no OCR: ' + err.message); }
+}
+
+async function ocrPass(worker, img) {
+  // number: digits-only, sparse text — the collector number is tiny and sits in a corner
+  await worker.setParameters({ tessedit_char_whitelist: '0123456789/', tessedit_pageseg_mode: '11' });
+  const bottom = (await worker.recognize(band(img, 0.88, 1, 2400))).data.text;
+  await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: '6' });
+  const top = (await worker.recognize(band(img, 0.02, 0.12))).data.text;
+  const num = bottom.replace(/\s+/g, ' ').match(/(\d{1,3}) ?\/ ?(\d{2,3})/);
+  const skip = /^(basic|stage|basico|básico|estágio|estagio|evolves|evolui|trainer|item|pokémon|pokemon)$/i;
+  const name = (top.match(/[A-ZÀ-Ú][A-Za-zÀ-ú'.-]{2,}/g) || []).find(w => !skip.test(w)) || '';
+  return { name, num, top, bottom };
+}
+
+function rotate180(img) {
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  const g = c.getContext('2d');
+  g.translate(c.width, c.height); g.rotate(Math.PI);
+  g.drawImage(img, 0, 0);
+  return c;
 }
 
 function toCanvas(img) {
@@ -237,8 +258,8 @@ function toCanvas(img) {
 }
 
 // crop a horizontal band (fractions of height), upscale, grayscale + contrast
-function band(img, y0, y1) {
-  const sh = img.height * (y1 - y0), scale = Math.max(1, 1600 / img.width);
+function band(img, y0, y1, targetW = 1600) {
+  const sh = img.height * (y1 - y0), scale = Math.max(1, targetW / img.width);
   const c = document.createElement('canvas');
   c.width = img.width * scale; c.height = sh * scale;
   const g = c.getContext('2d');
@@ -265,6 +286,14 @@ async function search(text) {
   $('results').innerHTML = '';
   const API = 'https://api.tcgdex.net/v2/en/cards';
   try {
+    if (num) {
+      const byNum = await findByNumber(+num[1], +num[2], name);
+      if (byNum.length) {
+        status(`${byNum.length} resultado(s) pelo número`);
+        return byNum.forEach(render);
+      }
+    }
+    if (!name) return status('Nada encontrado para esse número.');
     const qs = new URLSearchParams();
     if (name) qs.set('name', name);
     let list = await (await fetch(`${API}?${qs}`)).json();
@@ -277,6 +306,18 @@ async function search(text) {
     status(cards.length ? `${cards.length} resultado(s)` : 'Nada encontrado.');
     cards.forEach(render);
   } catch { status('Erro na busca. Tente de novo.'); }
+}
+
+// "136/189": every physical set whose printed total is 189, then card 136 in each
+let setsP;
+async function findByNumber(n, total, name) {
+  setsP ??= fetch('https://api.tcgdex.net/v2/en/sets').then(r => r.json());
+  const sets = (await setsP).filter(s => s.cardCount?.official === total && !/^(A\d|P-A)/.test(s.id));
+  const cards = (await Promise.all(sets.map(s =>
+    fetch(`https://api.tcgdex.net/v2/en/sets/${s.id}/${n}`).then(r => r.ok ? r.json() : null).catch(() => null)
+  ))).filter(Boolean);
+  const named = name && cards.filter(c => c.name.toLowerCase().includes(name.toLowerCase()));
+  return named?.length ? named : cards;
 }
 
 const brl = (v, rate) => v && rate ? ` ≈ R$ ${(v * rate).toFixed(2)}` : '';
