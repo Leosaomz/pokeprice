@@ -219,10 +219,12 @@ async function readCard(img) {
     workerP ??= Tesseract.createWorker('eng');
     const worker = await workerP;
     // try upright, then upside-down (card held the other way)
+    // upright score: collector number found, or "Name ... HP" on the first line
+    const score = r => (r.num ? 2 : 0) + (/[A-Z][a-z]{3,}.*\d{2,3}/.test(r.top.split('\n')[0]) ? 1 : 0);
     let r = await ocrPass(worker, img);
-    if (!r.num) {
+    if (score(r) < 2) {
       const flipped = await ocrPass(worker, rotate180(img));
-      if (flipped.num || !r.name) r = flipped;
+      if (score(flipped) > score(r)) r = flipped;
     }
     const { name, num, top, bottom } = r;
     const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
