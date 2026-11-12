@@ -34,6 +34,7 @@
   <input id="q" type="text" placeholder="ou digite: Pikachu 25/165" style="margin-top:12px">
   <button class="sec" onclick="search(document.getElementById('q').value)">Buscar</button>
   <div id="status"></div>
+  <pre id="debug" style="color:var(--muted);font-size:12px;white-space:pre-wrap"></pre>
   <div id="results"></div>
 </main>
 
@@ -57,15 +58,35 @@ fetch('https://open.er-api.com/v6/latest/BRL').then(r => r.json())
 $('cam').onchange = async e => {
   const file = e.target.files[0];
   if (!file) return;
-  status('Lendo a carta…');
-  const { data } = await Tesseract.recognize(file, 'eng');
-  // ponytail: naive OCR heuristic (number "025/165" + first long word); swap for a vision model if accuracy matters
-  const num = data.text.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
-  const name = (data.text.match(/[A-Z][a-zé]{3,}/) || [''])[0];
-  const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
-  $('q').value = q;
-  q ? search(q) : status('Não consegui ler. Digite o nome/número.');
+  status('Lendo a carta… (a 1ª vez demora)');
+  try {
+    const img = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const worker = await Tesseract.createWorker('eng');
+    // ponytail: fixed crop bands assume the card fills the photo; a vision model fixes this if it's not enough
+    const top = (await worker.recognize(band(img, 0.02, 0.13))).data.text;
+    const bottom = (await worker.recognize(band(img, 0.86, 1))).data.text;
+    await worker.terminate();
+    const num = bottom.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
+    const skip = /^(basic|stage|basico|básico|estágio|estagio|evolves|evolui|trainer|item)$/i;
+    const name = (top.match(/[A-ZÀ-Ú][A-Za-zÀ-ú'.-]{2,}/g) || []).find(w => !skip.test(w)) || '';
+    const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
+    $('q').value = q;
+    $('debug').textContent = `Topo: ${top.trim() || '—'}\nRodapé: ${bottom.trim() || '—'}`;
+    q ? search(q) : status('Não consegui ler. Digite o nome/número.');
+  } catch (err) { status('Erro no OCR: ' + err.message); }
+  e.target.value = '';
 };
+
+// crop a horizontal band (fractions of height), upscale, grayscale + contrast
+function band(img, y0, y1) {
+  const sh = img.height * (y1 - y0), scale = Math.max(1, 1600 / img.width);
+  const c = document.createElement('canvas');
+  c.width = img.width * scale; c.height = sh * scale;
+  const g = c.getContext('2d');
+  g.filter = 'grayscale(1) contrast(1.8)';
+  g.drawImage(img, 0, img.height * y0, img.width, sh, 0, 0, c.width, c.height);
+  return c;
+}
 
 async function search(text) {
   text = text.trim();
