@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PokéPreço</title>
+<style>
+  :root { --bg:#0f1220; --card:#1a1f35; --fg:#eef; --muted:#99a; --acc:#ffcb05; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:480px; margin:auto; padding:16px; }
+  h1 { color:var(--acc); margin:8px 0 16px; }
+  button, input { font:inherit; border-radius:12px; border:0; padding:14px; width:100%; }
+  button { background:var(--acc); color:#222; font-weight:700; margin-top:8px; }
+  button.sec { background:var(--card); color:var(--fg); }
+  input[type=text] { background:var(--card); color:var(--fg); }
+  #status { color:var(--muted); min-height:1.5em; margin:12px 0; }
+  .res { display:flex; gap:12px; background:var(--card); border-radius:12px; padding:10px; margin-top:10px; }
+  .res img { width:110px; border-radius:6px; }
+  .res small { color:var(--muted); }
+  .price { margin:4px 0; }
+  .price b { color:var(--acc); }
+  dialog { width:100%; max-width:100%; height:100%; max-height:100%; margin:0; padding:0; border:0; background:var(--bg); }
+  dialog header { display:flex; gap:8px; padding:8px; }
+  dialog iframe { width:100%; height:calc(100% - 64px); border:0; background:#fff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PokéPreço</h1>
+  <!-- native camera picker: no getUserMedia needed -->
+  <label><button onclick="document.getElementById('cam').click()">📷 Fotografar carta</button></label>
+  <input id="cam" type="file" accept="image/*" capture="environment" hidden>
+  <input id="q" type="text" placeholder="ou digite: Pikachu 25/165" style="margin-top:12px">
+  <button class="sec" onclick="search(document.getElementById('q').value)">Buscar</button>
+  <div id="status"></div>
+  <div id="results"></div>
+</main>
+
+<dialog id="liga">
+  <header>
+    <button class="sec" onclick="liga.close()">✕ Fechar</button>
+    <button id="ligaOut">Abrir fora ↗</button>
+  </header>
+  <iframe id="ligaFrame"></iframe>
+</dialog>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+let brlUsd = null, brlEur = null;
+
+fetch('https://open.er-api.com/v6/latest/BRL').then(r => r.json())
+  .then(d => { brlUsd = 1 / d.rates.USD; brlEur = 1 / d.rates.EUR; }).catch(() => {});
+
+$('cam').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  status('Lendo a carta…');
+  const { data } = await Tesseract.recognize(file, 'eng');
+  // ponytail: naive OCR heuristic (number "025/165" + first long word); swap for a vision model if accuracy matters
+  const num = data.text.match(/(\d{1,3})\s*\/\s*(\d{2,3})/);
+  const name = (data.text.match(/[A-Z][a-zé]{3,}/) || [''])[0];
+  const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
+  $('q').value = q;
+  q ? search(q) : status('Não consegui ler. Digite o nome/número.');
+};
+
+async function search(text) {
+  text = text.trim();
+  if (!text) return;
+  const num = text.match(/(\d+)\s*\/\s*(\d+)/);
+  const name = text.replace(/\d+\s*\/\s*\d+/, '').trim();
+  if (!name && !num) return status('Digite o nome da carta.');
+  status('Buscando…');
+  $('results').innerHTML = '';
+  const API = 'https://api.tcgdex.net/v2/en/cards';
+  try {
+    const qs = new URLSearchParams();
+    if (name) qs.set('name', name);
+    let list = await (await fetch(`${API}?${qs}`)).json();
+    // drop TCG Pocket (digital) cards, match collector number client-side (API keeps leading zeros)
+    list = list.filter(c => c.image && !/^(A\d|P-A)/.test(c.id) && (!num || +c.localId === +num[1]));
+    // ponytail: detail fetch per card (pricing only on detail); capped at 12
+    let cards = await Promise.all(list.slice(-12).reverse().map(c => fetch(`${API}/${c.id}`).then(r => r.json())));
+    const exact = num && cards.filter(c => c.set.cardCount?.official === +num[2]);
+    if (exact?.length) cards = exact;
+    status(cards.length ? `${cards.length} resultado(s)` : 'Nada encontrado.');
+    cards.forEach(render);
+  } catch { status('Erro na busca. Tente de novo.'); }
+}
+
+const brl = (v, rate) => v && rate ? ` ≈ R$ ${(v * rate).toFixed(2)}` : '';
+
+function render(c) {
+  const p = c.pricing || {};
+  const tcg = Object.entries(p.tcgplayer || {}).filter(([, v]) => typeof v === 'object')
+    .map(([k, v]) => `<div class="price">TCGplayer ${k}: <b>US$ ${v.marketPrice ?? v.midPrice ?? '-'}</b>${brl(v.marketPrice ?? v.midPrice, brlUsd)}</div>`).join('');
+  const cm = p.cardmarket?.trend;
+  const el = document.createElement('div');
+  el.className = 'res';
+  el.innerHTML = `<img src="${c.image}/low.webp" alt="${c.name}">
+    <div><strong>${c.name}</strong><br><small>${c.set.name} · ${c.localId}/${c.set.cardCount?.official ?? '?'}</small>
+    ${tcg}${cm ? `<div class="price">Cardmarket: <b>€ ${cm}</b>${brl(cm, brlEur)}</div>` : ''}
+    <button>Ver na Liga</button></div>`;
+  el.querySelector('button').onclick = () => openLiga(c.name);
+  $('results').append(el);
+}
+
+function openLiga(name) {
+  const url = 'https://www.ligapokemon.com.br/?view=cards/search&card=' + encodeURIComponent(name);
+  $('ligaFrame').src = url;
+  $('ligaOut').onclick = () => window.open(url, '_blank');
+  $('liga').showModal();
+}
+</script>
+</body>
+</html>
