@@ -16,7 +16,7 @@
   input[type=text] { background:var(--card); color:var(--fg); }
   #status { color:var(--muted); min-height:1.5em; margin:12px 0; }
   #debug { color:var(--muted); font-size:12px; white-space:pre-wrap; }
-  #shot { display:block; max-width:160px; border-radius:8px; margin:8px auto; }
+  #bands canvas { display:block; width:100%; height:auto; border-radius:6px; margin:6px 0; }
   .res { display:flex; gap:12px; background:var(--card); border-radius:12px; padding:10px; margin-top:10px; }
   .res img { width:110px; border-radius:6px; }
   .res small { color:var(--muted); }
@@ -40,7 +40,7 @@
   <input id="q" type="text" placeholder="ou digite: Pikachu 25/165" style="margin-top:12px">
   <button class="sec" onclick="search($('q').value)">Buscar</button>
   <div id="status"></div>
-  <img id="shot" hidden alt="Carta capturada">
+  <div id="bands"></div>
   <pre id="debug"></pre>
   <div id="results"></div>
 </main>
@@ -97,6 +97,7 @@ async function openScanner() {
     $('scanTip').textContent = 'Sem acesso à câmera: ' + err.message;
     return;
   }
+  stream.getVideoTracks()[0].applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
   const v = $('video');
   v.srcObject = stream;
   await v.play();
@@ -177,24 +178,60 @@ function drawOverlay(quad) {
   g.beginPath(); quad.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y)); g.closePath(); g.stroke();
 }
 
-// warp the card out of the full-res frame; manual = use whole frame if nothing detected
+// take a real photo (full sensor + autofocus), find the card again in it, warp it out
 async function capture(manual) {
   if (busy) return;
   busy = true;
-  const v = $('video');
-  const full = document.createElement('canvas');
-  full.width = v.videoWidth; full.height = v.videoHeight;
-  full.getContext('2d').drawImage(v, 0, 0);
-  let out = full;
-  if (lastQuad) {
-    const s = v.videoWidth / 480;
-    let q = lastQuad.map(p => ({ x: p.x * s, y: p.y * s }));
+  clearInterval(timer);
+  $('scanTip').textContent = 'Tirando foto… não mexa';
+  const { img, photo } = await grabFrame();
+  let q = findIn(img);
+  if (!q && lastQuad && !photo) {                       // video frame: reuse the live quad
+    const s = img.width / 480;
+    q = lastQuad.map(p => ({ x: p.x * s, y: p.y * s }));
+  }
+  if (!q && !manual) {                                   // lost the card in the photo: keep scanning
+    busy = false; stable = 0;
+    timer = setInterval(detectFrame, 120);
+    return;
+  }
+  let out = img;
+  if (q) {
     if (dist(q[0], q[1]) > dist(q[0], q[3])) q = [q[3], q[0], q[1], q[2]];  // landscape → rotate to portrait
     const h = Math.max(H, dist(q[0], q[3]), dist(q[1], q[2]));              // keep native resolution
-    out = warp(full, q, Math.round(h * W / H), Math.round(h));
-  } else if (!manual) { busy = false; return; }
+    out = warp(img, q, Math.round(h * W / H), Math.round(h));
+  }
   closeScanner();
   readCard(out);
+}
+
+const MAX_SIDE = 3200;   // cap photo size so OpenCV doesn't run out of memory on 50MP sensors
+async function grabFrame() {
+  const track = stream.getVideoTracks()[0];
+  if (window.ImageCapture) {
+    try {
+      const blob = await new ImageCapture(track).takePhoto();
+      const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+      const s = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      return { img: c, photo: true };
+    } catch { /* iOS / unsupported: fall back to the video frame */ }
+  }
+  const v = $('video'), c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  return { img: c, photo: false };
+}
+
+// detect on a 480px copy, return corners in `img` coords
+function findIn(img) {
+  const s = 480 / img.width;
+  small.width = 480; small.height = Math.round(img.height * s);
+  small.getContext('2d').drawImage(img, 0, 0, small.width, small.height);
+  const q = findCard(small);
+  return q && q.map(p => ({ x: p.x / s, y: p.y / s }));
 }
 
 function warp(canvas, q, w = W, h = H) {
@@ -212,8 +249,7 @@ function warp(canvas, q, w = W, h = H) {
 // ---------- OCR ----------
 let workerP;
 async function readCard(img) {
-  $('shot').src = (img.toDataURL ? img : toCanvas(img)).toDataURL('image/jpeg', 0.8);
-  $('shot').hidden = false;
+  $('bands').innerHTML = '';
   status('Lendo a carta… (a 1ª vez demora)');
   try {
     workerP ??= Tesseract.createWorker('eng');
@@ -227,6 +263,7 @@ async function readCard(img) {
       if (score(flipped) > score(r)) r = flipped;
     }
     const { name, num, top, bottom } = r;
+    $('bands').append(r.topImg, r.bottomImg);
     const q = [name, num && `${+num[1]}/${num[2]}`].filter(Boolean).join(' ');
     $('q').value = q;
     $('debug').textContent = `Imagem: ${img.width}×${img.height}\nTopo: ${top.trim() || '—'}\nRodapé: ${bottom.trim() || '—'}`;
@@ -237,13 +274,14 @@ async function readCard(img) {
 async function ocrPass(worker, img) {
   // number: digits-only, sparse text — the collector number is tiny and sits in a corner
   await worker.setParameters({ tessedit_char_whitelist: '0123456789/', tessedit_pageseg_mode: '11' });
-  const bottom = (await worker.recognize(band(img, 0.88, 1, 2400))).data.text;
+  const bottomImg = band(img, 0.88, 1, 2400), topImg = band(img, 0.02, 0.12);
+  const bottom = (await worker.recognize(bottomImg)).data.text;
   await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: '6' });
-  const top = (await worker.recognize(band(img, 0.02, 0.12))).data.text;
+  const top = (await worker.recognize(topImg)).data.text;
   const num = bottom.replace(/\s+/g, ' ').match(/(\d{1,3}) ?\/ ?(\d{2,3})/);
   const skip = /^(basic|stage|basico|básico|estágio|estagio|evolves|evolui|trainer|item|pokémon|pokemon)$/i;
   const name = (top.match(/[A-ZÀ-Ú][A-Za-zÀ-ú'.-]{2,}/g) || []).find(w => !skip.test(w)) || '';
-  return { name, num, top, bottom };
+  return { name, num, top, bottom, topImg, bottomImg };
 }
 
 function rotate180(img) {
