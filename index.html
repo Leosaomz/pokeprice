@@ -103,7 +103,7 @@ async function openScanner() {
   await v.play();
   $('scanTip').textContent = 'Carregando detector…';
   await cvPromise;
-  $('scanTip').textContent = 'Aponte para a carta, sobre um fundo liso';
+  $('scanTip').textContent = 'Aponte para a carta ou encaixe-a na moldura e toque em Capturar';
   stable = 0; lastQuad = null; busy = false;
   timer = setInterval(detectFrame, 120);
 }
@@ -127,7 +127,7 @@ function detectFrame() {
   drawOverlay(quad && quad.map(p => ({ x: p.x / s, y: p.y / s })));
   if (!quad) { stable = 0; lastQuad = null; return; }
   const moved = lastQuad ? Math.max(...quad.map((p, i) => Math.hypot(p.x - lastQuad[i].x, p.y - lastQuad[i].y))) : 99;
-  stable = moved < 6 ? stable + 1 : 0;
+  stable = moved < 12 ? stable + 1 : 0;   // calibration knob: hand shake tolerance (px at 480 wide)
   lastQuad = quad;
   $('scanTip').textContent = stable ? `Segure firme… ${Math.min(100, Math.round(stable / STABLE_FRAMES * 100))}%` : 'Carta detectada';
   if (stable >= STABLE_FRAMES) capture(false);
@@ -143,19 +143,31 @@ function findCard(canvas) {
     cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
     cv.Canny(gray, edges, 40, 120);
     cv.dilate(edges, edges, cv.Mat.ones(3, 3, cv.CV_8U));
-    cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    // RETR_LIST: also inner contours (the card's yellow frame), useful when fingers break the outer edge
+    cv.findContours(edges, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
     for (let i = 0; i < contours.size(); i++) {
-      const c = contours.get(i), approx = new cv.Mat();
-      cv.approxPolyDP(c, approx, 0.03 * cv.arcLength(c, true), true);
-      const area = cv.contourArea(approx);
-      if (approx.rows === 4 && area > bestArea && cv.isContourConvex(approx)) {
-        const pts = order([0, 1, 2, 3].map(k => ({ x: approx.data32S[k * 2], y: approx.data32S[k * 2 + 1] })));
-        const w = (dist(pts[0], pts[1]) + dist(pts[3], pts[2])) / 2;
-        const h = (dist(pts[0], pts[3]) + dist(pts[1], pts[2])) / 2;
-        const ratio = Math.min(w, h) / Math.max(w, h);       // real card ≈ 0.716
-        if (ratio > 0.6 && ratio < 0.83) { best = pts; bestArea = area; }
+      const c = contours.get(i), hull = new cv.Mat(), approx = new cv.Mat();
+      cv.convexHull(c, hull);                                  // fingers on the edge → dents vanish in the hull
+      const hullArea = cv.contourArea(hull);
+      if (hullArea > bestArea) {
+        cv.approxPolyDP(hull, approx, 0.04 * cv.arcLength(hull, true), true);
+        let pts = null;
+        if (approx.rows === 4) {
+          pts = [0, 1, 2, 3].map(k => ({ x: approx.data32S[k * 2], y: approx.data32S[k * 2 + 1] }));
+        } else {
+          // not a clean quad: use the min-area rectangle if the hull fills it well
+          const r = cv.minAreaRect(hull);
+          if (hullArea / (r.size.width * r.size.height) > 0.88) pts = cv.RotatedRect.points(r).map(p => ({ x: p.x, y: p.y }));
+        }
+        if (pts) {
+          pts = order(pts);
+          const w = (dist(pts[0], pts[1]) + dist(pts[3], pts[2])) / 2;
+          const h = (dist(pts[0], pts[3]) + dist(pts[1], pts[2])) / 2;
+          const ratio = Math.min(w, h) / Math.max(w, h);       // real card ≈ 0.716
+          if (ratio > 0.6 && ratio < 0.83) { best = pts; bestArea = hullArea; }
+        }
       }
-      approx.delete(); c.delete();
+      hull.delete(); approx.delete(); c.delete();
     }
   } finally { src.delete(); gray.delete(); edges.delete(); contours.delete(); hier.delete(); }
   return best;
@@ -173,56 +185,88 @@ function drawOverlay(quad) {
   o.width = v.videoWidth; o.height = v.videoHeight;
   const g = o.getContext('2d');
   g.clearRect(0, 0, o.width, o.height);
-  if (!quad) return;
+  if (!quad) {                                  // no card found: show the manual guide frame
+    const r = guideRect(o.width, o.height);
+    g.setLineDash([24, 16]); g.lineWidth = 6; g.strokeStyle = 'rgba(255,255,255,.8)';
+    g.strokeRect(r.x, r.y, r.w, r.h);
+    return;
+  }
+  g.setLineDash([]);
   g.lineWidth = 8; g.strokeStyle = stable ? '#3ddc84' : '#ffcb05';
   g.beginPath(); quad.forEach((p, i) => i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y)); g.closePath(); g.stroke();
 }
 
+// card-shaped frame, centered, 80% of the shorter fit
+function guideRect(w, h) {
+  const gh = Math.min(h * 0.8, w * 0.8 / 0.716), gw = gh * 0.716;
+  return { x: (w - gw) / 2, y: (h - gh) / 2, w: gw, h: gh };
+}
+
+function videoFrame() {
+  const v = $('video'), c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  return c;
+}
+
 // take a real photo (full sensor + autofocus), find the card again in it, warp it out
 async function capture(manual) {
-  if (busy) return;
+  if (busy || !stream) return;
   busy = true;
   clearInterval(timer);
   $('scanTip').textContent = 'Tirando foto… não mexa';
-  const { img, photo } = await grabFrame();
-  let q = findIn(img);
-  if (!q && lastQuad && !photo) {                       // video frame: reuse the live quad
-    const s = img.width / 480;
-    q = lastQuad.map(p => ({ x: p.x * s, y: p.y * s }));
-  }
-  if (!q && !manual) {                                   // lost the card in the photo: keep scanning
+  try {
+    const ready = !!window.cv?.Mat;
+    const { img, photo } = await grabFrame();
+    let src = img, q = ready ? findIn(img) : null;
+    if (!q && lastQuad && !photo) {                     // video frame: reuse the live quad
+      const s = img.width / 480;
+      q = lastQuad.map(p => ({ x: p.x * s, y: p.y * s }));
+    }
+    if (!q && !manual) {                                 // lost the card in the photo: keep scanning
+      busy = false; stable = 0;
+      timer = setInterval(detectFrame, 120);
+      return;
+    }
+    let out;
+    if (q) {
+      if (dist(q[0], q[1]) > dist(q[0], q[3])) q = [q[3], q[0], q[1], q[2]];  // landscape → rotate to portrait
+      const h = Math.max(H, dist(q[0], q[3]), dist(q[1], q[2]));              // keep native resolution
+      out = warp(src, q, Math.round(h * W / H), Math.round(h));
+    } else {
+      // manual, nothing detected: crop the guide frame from what the user sees
+      src = photo ? videoFrame() : img;
+      const r = guideRect(src.width, src.height);
+      out = document.createElement('canvas');
+      out.width = Math.round(r.w); out.height = Math.round(r.h);
+      out.getContext('2d').drawImage(src, r.x, r.y, r.w, r.h, 0, 0, out.width, out.height);
+    }
+    closeScanner();
+    readCard(out);
+  } catch (err) {
+    $('scanTip').textContent = 'Erro ao capturar: ' + err.message;
     busy = false; stable = 0;
     timer = setInterval(detectFrame, 120);
-    return;
   }
-  let out = img;
-  if (q) {
-    if (dist(q[0], q[1]) > dist(q[0], q[3])) q = [q[3], q[0], q[1], q[2]];  // landscape → rotate to portrait
-    const h = Math.max(H, dist(q[0], q[3]), dist(q[1], q[2]));              // keep native resolution
-    out = warp(img, q, Math.round(h * W / H), Math.round(h));
-  }
-  closeScanner();
-  readCard(out);
 }
+
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 
 const MAX_SIDE = 3200;   // cap photo size so OpenCV doesn't run out of memory on 50MP sensors
 async function grabFrame() {
   const track = stream.getVideoTracks()[0];
   if (window.ImageCapture) {
     try {
-      const blob = await new ImageCapture(track).takePhoto();
+      const blob = await withTimeout(new ImageCapture(track).takePhoto(), 4000);
       const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
       const s = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
       const c = document.createElement('canvas');
       c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s);
       c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
       return { img: c, photo: true };
-    } catch { /* iOS / unsupported: fall back to the video frame */ }
+    } catch { /* iOS / unsupported / hung: fall back to the video frame */ }
   }
-  const v = $('video'), c = document.createElement('canvas');
-  c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v, 0, 0);
-  return { img: c, photo: false };
+  return { img: videoFrame(), photo: false };
 }
 
 // detect on a 480px copy, return corners in `img` coords
